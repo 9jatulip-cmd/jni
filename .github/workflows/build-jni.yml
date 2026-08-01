@@ -1,0 +1,172 @@
+# Build JNI (armeabi-v7a + arm64-v8a) using Android NDK r25c.
+# - Extracts jni.zip from repo root
+# - Detects Android.mk (ndk-build) or CMakeLists.txt (CMake)
+# - Builds for each ABI (matrix) and uploads per-ABI artifacts
+# - Fails with clear messages when files are missing
+name: Build JNI (armeabi-v7a + arm64-v8a)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+      - master
+  pull_request: {}
+
+env:
+  NDK_VERSION: r25c
+  ANDROID_PLATFORM: android-21
+
+jobs:
+  build-per-abi:
+    name: Build for ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure unzip & wget are available
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip wget
+
+      - name: Check and extract jni.zip
+        run: |
+          set -euo pipefail
+          if [ ! -f "jni.zip" ]; then
+            echo "Error: jni.zip not found in the repository root. Please add jni.zip to the repo." >&2
+            exit 1
+          fi
+          rm -rf extracted_jni
+          mkdir -p extracted_jni
+          unzip -q jni.zip -d extracted_jni || { echo "Error: failed to unzip jni.zip" >&2; exit 1; }
+          echo "Extracted jni.zip into extracted_jni/"
+          ls -la extracted_jni || true
+        shell: bash
+
+      - name: Install Android NDK r25c
+        run: |
+          set -euo pipefail
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          URL="https://dl.google.com/android/repository/${NDK_ZIP}"
+          echo "Downloading NDK from ${URL}"
+          wget -q "${URL}" -O "${NDK_ZIP}" || { echo "Error: failed to download NDK ${NDK_VERSION}" >&2; exit 1; }
+          unzip -q "${NDK_ZIP}"
+          if [ ! -d "android-ndk-${NDK_VERSION}" ]; then
+            echo "Error: expected android-ndk-${NDK_VERSION} after extraction but it was not found" >&2
+            ls -la
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=${PWD}/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          echo "${PWD}/android-ndk-${NDK_VERSION}" >> $GITHUB_PATH
+        shell: bash
+
+      - name: Detect build system and prepare build
+        id: detect
+        run: |
+          set -euo pipefail
+          ROOT="${PWD}/extracted_jni"
+          if [ ! -d "$ROOT" ]; then
+            echo "Error: extracted_jni directory not found. Extraction must have failed." >&2
+            exit 1
+          fi
+
+          # Find Android.mk or CMakeLists.txt
+          ANDROID_MK_PATH=$(find "$ROOT" -type f -name "Android.mk" -print -quit || true)
+          CMAKE_PATH=$(find "$ROOT" -type f -name "CMakeLists.txt" -print -quit || true)
+
+          if [ -n "$ANDROID_MK_PATH" ]; then
+            echo "build_system=ndk-build" >> $GITHUB_OUTPUT
+            echo "build_dir=$(dirname \"$ANDROID_MK_PATH\")" >> $GITHUB_OUTPUT
+            echo "detected_file=$ANDROID_MK_PATH" >> $GITHUB_OUTPUT
+            echo "Detected ndk-build (Android.mk) at $ANDROID_MK_PATH"
+          elif [ -n "$CMAKE_PATH" ]; then
+            echo "build_system=cmake" >> $GITHUB_OUTPUT
+            echo "build_dir=$(dirname \"$CMAKE_PATH\")" >> $GITHUB_OUTPUT
+            echo "detected_file=$CMAKE_PATH" >> $GITHUB_OUTPUT
+            echo "Detected CMake (CMakeLists.txt) at $CMAKE_PATH"
+          else
+            echo "Error: No Android.mk or CMakeLists.txt found inside jni.zip (extracted to extracted_jni)." >&2
+            echo "Searched path: $ROOT" >&2
+            echo "Please ensure the archive contains either an Android.mk (for ndk-build) or a CMakeLists.txt (for CMake)." >&2
+            exit 1
+          fi
+        shell: bash
+
+      - name: Build and collect .so files
+        run: |
+          set -euo pipefail
+          ABI="${{ matrix.abi }}"
+          NDK_HOME="${ANDROID_NDK_HOME}"
+          BUILD_DIR="${{ steps.detect.outputs.build_dir }}"
+          BUILD_SYSTEM="${{ steps.detect.outputs.build_system }}"
+          echo "Building ABI: $ABI using $BUILD_SYSTEM from $BUILD_DIR"
+
+          ARTIFACT_DIR="${PWD}/artifacts/${ABI}"
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+
+          if [ "$BUILD_SYSTEM" = "ndk-build" ]; then
+            pushd "$BUILD_DIR" >/dev/null
+            if [ ! -x "${NDK_HOME}/ndk-build" ]; then
+              echo "Error: ndk-build not found at ${NDK_HOME}/ndk-build" >&2
+              exit 1
+            fi
+            "${NDK_HOME}/ndk-build" -j$(nproc) APP_ABI=$ABI NDK_OUT=out/NDK_OUT NDK_LIBS_OUT=out/NDK_LIBS_OUT || { echo "ndk-build failed for ABI $ABI" >&2; exit 1; }
+            # Collect .so files
+            echo "Searching for .so outputs..."
+            # Common output locations:
+            if [ -d "libs/$ABI" ]; then
+              cp -v libs/$ABI/*.so "$ARTIFACT_DIR/" || true
+            fi
+            if [ -d "out/NDK_LIBS_OUT/$ABI" ]; then
+              cp -v out/NDK_LIBS_OUT/$ABI/*.so "$ARTIFACT_DIR/" || true
+            fi
+            # Fallback: find any .so under build tree containing ABI in path
+            find . -type f -name "*.so" -path "*/$ABI/*" -exec cp --parents {} "$ARTIFACT_DIR/" \; || true
+            popd >/dev/null
+
+          elif [ "$BUILD_SYSTEM" = "cmake" ]; then
+            SRC_DIR="$BUILD_DIR"
+            BUILD_SUBDIR="${PWD}/build-${ABI}"
+            rm -rf "$BUILD_SUBDIR"
+            mkdir -p "$BUILD_SUBDIR"
+
+            cmake -S "$SRC_DIR" -B "$BUILD_SUBDIR" \
+              -DCMAKE_TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake" \
+              -DANDROID_NDK="${NDK_HOME}" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
+              -DCMAKE_BUILD_TYPE=Release || { echo "CMake configuration failed for ABI $ABI" >&2; exit 1; }
+
+            cmake --build "$BUILD_SUBDIR" --config Release -- -j$(nproc) || { echo "CMake build failed for ABI $ABI" >&2; exit 1; }
+
+            # Collect produced .so files
+            find "$BUILD_SUBDIR" -type f -name "*.so" -exec cp --parents {} "$ARTIFACT_DIR/" \; || true
+            if [ -d "$BUILD_SUBDIR/libs/$ABI" ]; then
+              cp -v "$BUILD_SUBDIR/libs/$ABI"/*.so "$ARTIFACT_DIR/" || true
+            fi
+          else
+            echo "Error: Unsupported build system: $BUILD_SYSTEM" >&2
+            exit 1
+          fi
+
+          if [ -z "$(ls -A "$ARTIFACT_DIR" 2>/dev/null || true)" ]; then
+            echo "Warning: No .so files found for ABI $ABI. The build may have failed or produced outputs in an unexpected location." >&2
+            echo "Look at the build logs above for errors and ensure the project layout matches ndk-build or CMake expectations." >&2
+            # Fail the job because user requested failure on missing outputs. If you prefer non-fatal, change this to a warning only.
+            exit 1
+          else
+            echo "Collected files for $ABI:"
+            ls -la "$ARTIFACT_DIR" || true
+          fi
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jni-libs-${{ matrix.abi }}
+          path: artifacts/${{ matrix.abi }}
